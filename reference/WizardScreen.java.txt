@@ -1,0 +1,99 @@
+package com.cloudvault.client.gui;
+
+import com.cloudvault.client.ClientBridge;
+import com.cloudvault.cloud.google.BuiltInOAuth;
+import com.cloudvault.config.BackupSettings;
+import com.cloudvault.config.CloudVaultConfig;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
+import net.minecraft.client.gui.screens.Screen;
+
+/**
+ * First-launch setup: Welcome > Cloud > What to back up > Done. One straight line with Back/Next: it never opens the settings pages
+ * on the way, and it never comes back by itself (it counts as done the moment it opens; "Run setup again" is in Settings > Advanced).
+ * The full settings page is offered once, on the last step.
+ */
+public class WizardScreen extends BaseScreen {
+	@Override protected boolean showCrumbs() { return false; }
+	private static final int LAST = 3;
+	private int step = 0;
+	private String note = "";
+
+	public WizardScreen(Screen parent) {
+		super("Welcome to CloudVault", parent);
+		markDone();
+	}
+
+	private CloudVaultConfig cfg() { return ClientBridge.core.config; }
+	private BackupSettings s() { return cfg().global; }
+
+	private void markDone() { if (!cfg().firstLaunchDone) { cfg().firstLaunchDone = true; ClientBridge.core.saveConfig(); } }
+	private void rebuild() { this.clearWidgets(); this.init(); }
+	private static String onOff(boolean b) { return b ? "ON" : "OFF"; }
+
+	private void toggle(int y, String label, boolean value, Runnable flip) {
+		btn(label + ": " + onOff(value), this.width / 2 - 120, y, 240, () -> { flip.run(); ClientBridge.core.saveConfig(); rebuild(); });
+	}
+
+	@Override protected void init() {
+		int cx = this.width / 2;
+		switch (step) {
+			case 1 -> {
+				boolean useS3 = "s3".equals(cfg().cloudProvider);
+				btn("Cloud: " + ClientBridge.providerName() + " (click to change)", cx - 120, 62, 240, () -> { ClientBridge.selectProvider(useS3 ? "google_drive" : "s3"); note = ""; rebuild(); });
+				if (useS3) btn("Enter storage details...", cx - 120, 88, 240, () -> this.minecraft.gui.setScreen(new S3SettingsScreen(this)));
+				else {
+					var connect = btn("Connect Google Drive (opens your browser)", cx - 120, 88, 240, () -> { note = "Finish signing in in your browser..."; background("wizard-auth", () -> {
+						ClientBridge.drive.authenticate(); ClientBridge.core.cloud.resumePending(); note = "Connected"; ClientBridge.toast("CloudVault", "Google Drive connected"); }); });
+					connect.active = BuiltInOAuth.available();
+				}
+				toggle(114, "Upload backups to the cloud", cfg().cloudEnabled, () -> cfg().cloudEnabled = !cfg().cloudEnabled);
+			}
+			case 2 -> {
+				toggle(56, "Back up when I join a world", s().session.joinEnabled, () -> s().session.joinEnabled = !s().session.joinEnabled);
+				toggle(80, "Back up when I leave a world", s().session.leaveEnabled, () -> s().session.leaveEnabled = !s().session.leaveEnabled);
+				toggle(104, "Periodic backups (every " + s().periodic.amount + " " + s().periodic.unit.label + ")", s().periodic.enabled, () -> s().periodic.enabled = !s().periodic.enabled);
+				toggle(128, "Gameplay backups (after " + s().gameplay.amount + " " + s().gameplay.unit.label + " of play)", s().gameplay.enabled, () -> s().gameplay.enabled = !s().gameplay.enabled);
+				toggle(152, "New worlds start with CloudVault", cfg().newWorldsEnabled, () -> ClientBridge.core.setNewWorldsEnabled(!cfg().newWorldsEnabled));
+			}
+			case LAST -> btn("Open all settings", cx - 100, 150, 200, () -> { finish(); this.minecraft.gui.setScreen(new SettingsScreen(parent, SettingsScreen.Page.SESSION)); });
+			default -> {}
+		}
+		// navigation: always the same place, always a straight line
+		var back = btn("< Back", cx - 130, this.height - 26, 70, () -> { step--; note = ""; rebuild(); });
+		back.active = step > 0;
+		btn(step == LAST ? "Finish" : "Next >", cx - 50, this.height - 26, 100, () -> { if (step == LAST) onClose(); else { step++; note = ""; rebuild(); } });
+		if (step < LAST) btn("Skip setup", cx + 60, this.height - 26, 80, this::onClose);
+	}
+
+	private void finish() { markDone(); ClientBridge.core.saveConfig(); }
+	@Override public void onClose() { finish(); this.minecraft.gui.setScreen(parent); }
+
+	@Override protected void draw(GuiGraphicsExtractor g, int mx, int my) {
+		int cx = this.width / 2;
+		centered(g, "Step " + (step + 1) + " of " + (LAST + 1), 26, GREY);
+		switch (step) {
+			case 0 -> {
+				centered(g, "CloudVault makes safe copies of your Minecraft worlds", 50, WHITE);
+				centered(g, "and keeps them in your own cloud storage.", 62, WHITE);
+				centered(g, "Every backup is checked after it is made and again", 84, GREY);
+				centered(g, "after it is uploaded. Setup takes under a minute", 96, GREY);
+				centered(g, "and you can change everything later.", 108, GREY);
+			}
+			case 1 -> {
+				boolean ok = ClientBridge.provider().isAuthenticated();
+				centered(g, ok ? "Status: connected" : "Status: not connected yet", 40, ok ? GREEN : YELLOW);
+				centered(g, !note.isEmpty() ? note : cfg().cloudEnabled ? "You can also connect later: Settings > Cloud." : "Backups stay on this computer only.", 140, GREY);
+			}
+			case 2 -> centered(g, "Choose when CloudVault makes backups:", 40, GREY);
+			default -> {
+				boolean ok = ClientBridge.provider().isAuthenticated();
+				centered(g, "All set!", 40, GREEN);
+				centered(g, "Cloud: " + (cfg().cloudEnabled ? ClientBridge.providerName() + (ok ? " (connected)" : " (not connected yet)") : "this computer only"), 62, ok || !cfg().cloudEnabled ? WHITE : YELLOW);
+				centered(g, "Backups: " + (s().session.joinEnabled ? "join " : "") + (s().session.leaveEnabled ? "leave " : "") + (s().periodic.enabled ? "periodic " : "") + (s().gameplay.enabled ? "gameplay " : "") + "(manual always available)", 76, WHITE);
+				centered(g, "New worlds: CloudVault " + (cfg().newWorldsEnabled ? "ON" : "OFF"), 90, WHITE);
+				centered(g, "Open CloudVault any time: pause menu button or the CloudVault key.", 112, GREY);
+				centered(g, "Backups already in the cloud? Import them from Cloud > Manage cloud.", 124, GREY);
+			}
+		}
+	}
+}

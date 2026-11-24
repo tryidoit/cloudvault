@@ -1,0 +1,410 @@
+package com.cloudvault.client.gui;
+
+import com.cloudvault.CloudVaultCore;
+import com.cloudvault.client.ClientBridge;
+import com.cloudvault.cloud.google.BuiltInOAuth;
+import com.cloudvault.config.BackupSettings;
+import com.cloudvault.config.CloudVaultConfig;
+import com.cloudvault.config.CompressionPreset;
+import com.cloudvault.config.SyncSettings;
+import com.cloudvault.config.WorldSettings;
+import com.cloudvault.util.TimeUtil;
+import com.cloudvault.util.TimeUtil.Unit;
+import com.google.gson.Gson;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
+import net.minecraft.client.gui.components.Button;
+import net.minecraft.client.gui.components.EditBox;
+import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.network.chat.Component;
+
+import java.util.List;
+import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
+import java.util.function.IntConsumer;
+import java.util.function.IntSupplier;
+import java.util.function.Supplier;
+
+/**
+ * One screen, several tabs. Each tab starts with a short plain-language description. Edits the world override if one is
+ * active, otherwise the global defaults.
+ */
+public class SettingsScreen extends BaseScreen {
+	public enum Page {
+		SESSION("Join/Leave"), PERIODIC("Periodic"), GAMEPLAY("Gameplay"), MANUAL("Manual"), COMMENTS("Comments"), RETENTION("Retention"),
+		CLOUD("Cloud"), SYNC("Cloud Sync"), NOTIFICATIONS("Alerts"), ADVANCED("Advanced"), WORLD("Worlds");
+		final String label; Page(String l) { label = l; }
+	}
+
+	private static final int CONTENT_Y = 104;   // first row below the tabs, scope line and description
+	private static final int TOGGLE = 26, ROW = 36; // vertical space taken by a plain button row / a "label + controls" row
+
+	private Page page;
+	private int scroll = 0, contentBottom = 0, maxScroll = 0;
+	private boolean inContent = false;
+	private String note = "";
+	private final java.util.Map<Integer, Supplier<String>> labels = new java.util.HashMap<>();
+
+	private final String scopeWorldId, scopeWorldName; // set when opened for a specific world (e.g. from the Worlds screen); null = the open world, or global
+
+	public SettingsScreen(Screen parent, Page page) { this(parent, page, null, null); }
+
+	public SettingsScreen(Screen parent, Page page, String worldId, String worldName) {
+		super("CloudVault Settings", parent);
+		this.page = page; this.scopeWorldId = worldId; this.scopeWorldName = worldName;
+	}
+
+	/** The world these tabs edit (its own settings if it has them), or null for the global defaults. */
+	private String scopeId() { return scopeWorldId != null ? scopeWorldId : (core().inWorld() ? core().currentWorldId() : null); }
+
+	private String scopeName() {
+		if (scopeWorldName != null) return scopeWorldName;
+		if (core().inWorld() && core().currentWorldName() != null) return core().currentWorldName();
+		var w = scopeId() == null ? null : cfg().worlds.get(scopeId());
+		return w == null || w.lastKnownName.isEmpty() ? "this world" : w.lastKnownName;
+	}
+
+	private CloudVaultCore core() { return ClientBridge.core; }
+	private CloudVaultConfig cfg() { return core().config; }
+	private BackupSettings target() {
+		String id = scopeId();
+		if (id != null) { WorldSettings w = cfg().worlds.get(id); if (w != null && w.useOverride) return w.settings; }
+		return cfg().global;
+	}
+
+	/** Up to two short lines explaining what the tab does. */
+	private static String[] describe(Page p) {
+		return switch (p) {
+			case SESSION -> new String[]{"Automatic backups when you open a world", "and when you close it."};
+			case PERIODIC -> new String[]{"Backups on a fixed schedule while a world is open.", "Skipped when nothing has changed."};
+			case GAMEPLAY -> new String[]{"A backup after you have been playing", "for a set amount of time."};
+			case MANUAL -> new String[]{"Backups you start yourself: SAVE CURRENT STATE", "or the /cloudvault backup command."};
+			case COMMENTS -> new String[]{"A pop-up before a backup lets you type a comment (saved with", "the backup in the cloud). Choose which backup types ask."};
+			case SYNC -> new String[]{"Saves a world to the cloud sync folder when you leave it and", "brings it to your other computers automatically."};
+			case RETENTION -> new String[]{"How long old backups are kept.", "Simple: a number per backup type. Advanced: combined rules."};
+			case CLOUD -> new String[]{"Where backups are uploaded. A backup only counts", "as safe after the upload is checked."};
+			case NOTIFICATIONS -> new String[]{"Pop-up messages when backups start,", "finish or fail."};
+			case ADVANCED -> new String[]{"Master switch, disk use, compression, encryption", "and cleanup tools."};
+			case WORLD -> new String[]{"Which worlds use CloudVault, their own settings,", "and the on-screen indicator."};
+		};
+	}
+
+	@Override protected void init() {
+		int cx = this.width / 2;
+		labels.clear();
+		note = "";
+		Page[] ps = Page.values();
+		int tw = 62;
+		for (int i = 0; i < ps.length; i++) {
+			final Page p = ps[i];
+			int col = i % 6, row = i / 6;
+			var b = btn(p.label, cx - (6 * tw + 20) / 2 + col * (tw + 4), 22 + row * 22, tw, () -> { page = p; scroll = 0; rebuild(); });
+			b.active = p != page;
+		}
+		int y = CONTENT_Y - scroll;
+		inContent = true; contentBottom = 0;
+		switch (page) {
+			case SESSION -> {
+				toggle(y, "Back up when I join a world", () -> target().session.joinEnabled, v -> target().session.joinEnabled = v); y += TOGGLE;
+				toggle(y, "Back up when I leave a world", () -> target().session.leaveEnabled, v -> target().session.leaveEnabled = v); y += TOGGLE;
+				toggle(y, "Ask for a comment when I join", () -> target().session.joinComment, v -> target().session.joinComment = v, "A small window asks for a comment before this backup (the game is paused while it is open). The comment is saved inside the backup in the cloud."); y += TOGGLE;
+				toggle(y, "Ask for a comment when I leave", () -> target().session.leaveComment, v -> target().session.leaveComment = v, "A small window asks for a comment before this backup (the game is paused while it is open). The comment is saved inside the backup in the cloud."); y += TOGGLE;
+				retention(y, () -> target().session.retention, v -> target().session.retention = v);
+			}
+			case PERIODIC -> {
+				toggle(y, "Periodic backups", () -> target().periodic.enabled, v -> target().periodic.enabled = v, "Backs up on a fixed schedule while this world is open. Time you spend in menus still counts as time in the world."); y += TOGGLE;
+				time(y, () -> target().periodic.amount, v -> target().periodic.amount = v, () -> target().periodic.unit, u -> target().periodic.unit = u, TimeUtil.PERIODIC_UNITS, "Back up every"); y += ROW;
+				retention(y, () -> target().periodic.retention, v -> target().periodic.retention = v); y += ROW;
+				toggle(y, "Skip when the world has not changed", () -> target().periodic.avoidDuplicates, v -> target().periodic.avoidDuplicates = v, "If nothing in the world changed since the last periodic backup, no new backup is made. Saves space and uploads."); y += TOGGLE;
+				toggle(y, "Ask for a comment on each periodic backup", () -> target().periodic.comment, v -> target().periodic.comment = v, "A small window asks for a comment before this backup (the game is paused while it is open). The comment is saved inside the backup in the cloud.");
+			}
+			case GAMEPLAY -> {
+				toggle(y, "Gameplay backups", () -> target().gameplay.enabled, v -> target().gameplay.enabled = v, "Counts only time you are actually playing in the world (not menus, not other worlds). A backup is made when the timer is reached."); y += TOGGLE;
+				time(y, () -> target().gameplay.amount, v -> target().gameplay.amount = v, () -> target().gameplay.unit, u -> target().gameplay.unit = u, TimeUtil.GAMEPLAY_UNITS, "Back up after playing for"); y += ROW;
+				retention(y, () -> target().gameplay.retention, v -> target().gameplay.retention = v); y += ROW;
+				toggle(y, "Ask for a comment on each gameplay backup", () -> target().gameplay.comment, v -> target().gameplay.comment = v, "A small window asks for a comment before this backup (the game is paused while it is open). The comment is saved inside the backup in the cloud.");
+			}
+			case MANUAL -> {
+				retention(y, () -> target().manual.retention, v -> target().manual.retention = v); y += ROW;
+				toggle(y, "Ask before a manual backup", () -> target().manual.confirmBeforeBackup, v -> target().manual.confirmBeforeBackup = v); y += TOGGLE;
+				toggle(y, "Skip manual backup if world unchanged", () -> target().manual.avoidDuplicates, v -> target().manual.avoidDuplicates = v, "If the world is identical to your last manual backup, SAVE CURRENT STATE does nothing instead of making a duplicate."); y += TOGGLE;
+				toggle(y, "Ask for a comment on manual backups", () -> target().manual.comment, v -> target().manual.comment = v, "A small window asks for a comment before this backup (the game is paused while it is open). The comment is saved inside the backup in the cloud.");
+			}
+			case COMMENTS -> commentsPage(y);
+			case SYNC -> syncPage(y);
+			case RETENTION -> retentionPage(y);
+			case CLOUD -> cloudPage(y);
+			case NOTIFICATIONS -> toggle(y, "Show pop-up notifications", () -> cfg().notifications, v -> cfg().notifications = v);
+			case ADVANCED -> {
+				toggle(y, "Automatic backups (master switch)", () -> cfg().enabled, v -> cfg().enabled = v, "Off stops join, leave, periodic and gameplay backups everywhere. Manual backups still work."); y += TOGGLE;
+				int[] cache = {0, 1, 3, 5, 10};
+				btn("Copies kept on this computer: " + (cfg().localCacheKeep == 0 ? "none" : "last " + cfg().localCacheKeep) + " (click)", cx - 130, y, 260, () -> {
+					int idx = 0; for (int i = 0; i < cache.length; i++) if (cache[i] == cfg().localCacheKeep) idx = i;
+					cfg().localCacheKeep = cache[(idx + 1) % cache.length]; changed();
+				}, "How many uploaded backups also stay on this computer. Others are removed locally to save disk space and downloaded again when you restore."); y += TOGGLE;
+				CompressionPreset cp = CompressionPreset.forLevel(cfg().compressionLevel);
+				btn("Compression: " + (cp == null ? "Custom (level " + cfg().compressionLevel + ")" : cp.label) + " (click)", cx - 130, y, 260, () -> {
+					cfg().compressionLevel = (cp == null ? CompressionPreset.FAST : cp.next()).level; changed();
+				}); y += 26;
+				labels.put(y - 4, () -> { CompressionPreset c = CompressionPreset.forLevel(cfg().compressionLevel); return c == null ? "Custom compression level (0-9)" : c.description; });
+				y += 14;
+				btn("Encryption (experimental)...", cx - 130, y, 260, () -> this.minecraft.gui.setScreen(new EncryptionScreen(this)), "Encrypts backups on this computer before upload. If you lose both your password and recovery key, encrypted backups cannot be recovered."); y += TOGGLE;
+				btn("Cloud management...", cx - 130, y, 260, () -> this.minecraft.gui.setScreen(new CloudManageScreen(this))); y += TOGGLE;
+				btn("Storage and cleanup...", cx - 130, y, 260, () -> this.minecraft.gui.setScreen(new StorageScreen(this))); y += TOGGLE;
+				toggle(y, "Backup before Minecraft/mod updates", () -> cfg().backupBeforeUpdate, v -> cfg().backupBeforeUpdate = v,
+					"When Minecraft or your mods changed since a world was last opened, a safety backup (BEFORE UPDATE) is made before it opens. May add a short wait on the loading screen for big worlds."); y += TOGGLE;
+				int[] days = {0, 3, 7, 14, 30};
+				btn("Restore test: " + (cfg().restoreTestDays == 0 ? "off" : "every " + cfg().restoreTestDays + " days") + " (click)", cx - 130, y, 260, () -> {
+					int idx = 0; for (int i = 0; i < days.length; i++) if (days[i] == cfg().restoreTestDays) idx = i;
+					cfg().restoreTestDays = days[(idx + 1) % days.length]; changed();
+				}, "Quietly unpacks your latest backup into a temporary folder and checks it looks like a world, so you know it can be restored. Never touches your worlds. Uses some disk and CPU for a moment."); y += TOGGLE;
+				btn("Run setup again...", cx - 130, y, 260, () -> this.minecraft.gui.setScreen(new WizardScreen(this)), "Walks through cloud connection and backup choices again, step by step.");
+			}
+			case WORLD -> worldPage(y);
+		}
+		inContent = false;
+		// Rows that do not fit the window are reachable with the mouse wheel or these buttons.
+		int viewH = this.height - 34 - CONTENT_Y;
+		maxScroll = Math.max(0, contentBottom + scroll - CONTENT_Y - viewH + 4);
+		if (maxScroll > 0) {
+			btn("Up", this.width - 44, CONTENT_Y, 36, () -> scrollBy(-1), "Scroll up (or use the mouse wheel)").active = scroll > 0;
+			btn("Down", this.width - 44, this.height - 60, 36, () -> scrollBy(1), "Scroll down (or use the mouse wheel)").active = scroll < maxScroll;
+		}
+		btn("Done", cx - 50, this.height - 26, 100, this::onClose);
+	}
+
+	private void scrollBy(int steps) {
+		int n = Math.max(0, Math.min(maxScroll, scroll + steps * 26));
+		if (n != scroll) { scroll = n; rebuild(); }
+	}
+
+	/** Called for mouse-wheel events on this screen. @return true when the wheel was used */
+	public boolean onWheel(double vertical) {
+		if (maxScroll <= 0 || vertical == 0) return false;
+		scrollBy(vertical > 0 ? -1 : 1);
+		return true;
+	}
+
+	@Override protected Button btn(String label, int x, int y, int w, Runnable action, String tip) {
+		if (inContent) {
+			contentBottom = Math.max(contentBottom, y + 20);
+			if (y < CONTENT_Y || y + 20 > this.height - 34) return makeBtn(label, x, y, w, action, tip); // scrolled out of view
+		}
+		return super.btn(label, x, y, w, action, tip);
+	}
+
+	/** Saves without rebuilding the page (keeps typing focus in number boxes). */
+	private void edited() {
+		core().saveConfig();
+		if (core().inWorld()) core().periodic.reschedule(core().settings().periodic, java.time.ZonedDateTime.now());
+	}
+
+	/** Small numeric box between the -1 and +1 buttons. Non-numeric or out-of-range input is ignored (value stays as last valid). */
+	private void amountBox(int x, int y, Supplier<String> initial, Consumer<String> onValid) {
+		if (inContent) { contentBottom = Math.max(contentBottom, y + 20); if (y < CONTENT_Y || y + 20 > this.height - 34) return; }
+		EditBox box = new EditBox(this.font, x, y, 38, 20, Component.literal("Amount"));
+		box.setMaxLength(4);
+		box.setValue(initial.get());
+		box.setResponder(t -> { try { onValid.accept(t.trim()); } catch (NumberFormatException ignored) { /* empty or non-numeric: ignore */ } });
+		this.addRenderableWidget(box);
+	}
+
+	private void rebuild() { this.clearWidgets(); this.init(); }
+	private void changed() { edited(); rebuild(); }
+
+	private void toggle(int y, String label, BooleanSupplier get, Consumer<Boolean> set) { toggle(y, label, get, set, null); }
+
+	private void toggle(int y, String label, BooleanSupplier get, Consumer<Boolean> set, String tip) {
+		btn(label + ": " + (get.getAsBoolean() ? "ON" : "OFF"), this.width / 2 - 130, y, 260, () -> { set.accept(!get.getAsBoolean()); changed(); }, tip);
+	}
+
+	/** -10 -1 [typed box] +1 +10 buttons, label above. */
+	private void stepButtons(int y, IntSupplier get, IntConsumer step) {
+		int bx = this.width / 2 - 150;
+		for (int s : new int[]{-10, -1, 1, 10}) {
+			btn(s > 0 ? "+" + s : Integer.toString(s), bx, y + 12, 30, () -> step.accept(s));
+			bx += 32 + (s == -1 ? 40 : 0);
+		}
+	}
+
+	private void retention(int y, IntSupplier get, IntConsumer set) {
+		int x = this.width / 2 - 150;
+		stepButtons(y, get, s -> setRetention(get.getAsInt(), s, set));
+		btn("Keep All", x + 32 * 4 + 40 + 4, y + 12, 60, () -> setRetention(get.getAsInt(), Integer.MAX_VALUE, set), "Never delete backups of this type automatically. Cloud storage use can grow without limit. A number means: the newest backup plus that many older ones; 0 keeps only the newest.");
+		labels.put(y, () -> {
+			int v = get.getAsInt();
+			return v == BackupSettings.KEEP_ALL ? "Keep every backup (nothing is deleted automatically)"
+				: v == 0 ? "Keep only the newest backup" : "Keep the newest backup + " + v + " older ones";
+		});
+		amountBox(x + 64, y + 12, () -> get.getAsInt() == BackupSettings.KEEP_ALL ? "" : Integer.toString(get.getAsInt()), t -> { int v = Integer.parseInt(t); if (v >= 1 && v <= BackupSettings.MAX_RETENTION) { set.accept(v); edited(); } });
+	}
+
+	private void setRetention(int current, int delta, IntConsumer set) {
+		int next = delta == Integer.MAX_VALUE ? BackupSettings.KEEP_ALL : (current == BackupSettings.KEEP_ALL ? BackupSettings.MAX_RETENTION : current) + delta;
+		next = delta == Integer.MAX_VALUE ? next : Math.max(0, Math.min(BackupSettings.MAX_RETENTION, next));
+		if (next == current) return;
+		final int n = next;
+		if (n == 0) {
+			this.minecraft.gui.setScreen(new CvConfirmScreen(this, "Warning", List.of("Keeping only the newest backup means there is no older one", "to fall back on if the newest turns out to be damaged."), "Use 0", false, () -> { set.accept(0); changed(); }));
+		} else if (n == BackupSettings.KEEP_ALL) {
+			this.minecraft.gui.setScreen(new CvConfirmScreen(this, "Keep All", List.of("Backups in this category will never be deleted automatically.", "Cloud storage use can grow indefinitely."), "Keep All", false, () -> { set.accept(BackupSettings.KEEP_ALL); changed(); }));
+		} else { set.accept(n); changed(); }
+	}
+
+	private void time(int y, IntSupplier amount, IntConsumer setAmount, Supplier<Unit> unit, Consumer<Unit> setUnit, Unit[] units, String label) {
+		int x = this.width / 2 - 150;
+		stepButtons(y, amount, s -> {
+			int v = amount.getAsInt() + s;
+			if (TimeUtil.validAmount(v, unit.get())) { setAmount.accept(v); changed(); } else note = "Amount must be between 1 and the allowed maximum for " + unit.get().label;
+		});
+		btn(unit.get().label, x + 32 * 4 + 40 + 4, y + 12, 70, () -> {
+			int i = 0; for (int k = 0; k < units.length; k++) if (units[k] == unit.get()) i = k;
+			Unit n = units[(i + 1) % units.length];
+			setUnit.accept(n);
+			if (!TimeUtil.validAmount(amount.getAsInt(), n)) setAmount.accept(1);
+			changed();
+		});
+		labels.put(y, () -> label + ": " + amount.getAsInt() + " " + unit.get().label);
+		amountBox(x + 64, y + 12, () -> Integer.toString(amount.getAsInt()), t -> { int v = Integer.parseInt(t); if (TimeUtil.validAmount(v, unit.get())) { setAmount.accept(v); edited(); } else note = "Amount must be between 1 and the allowed maximum for " + unit.get().label; });
+	}
+
+	/** All comment switches on one page (the same switches also sit on each backup type's own tab). Edits this world's own settings when it has them. */
+	private void commentsPage(int y) {
+		String tip = "A small window asks for a comment before the backup (the game is paused while it is open). The comment is saved inside the backup in the cloud.";
+		toggle(y, "Comment when I join a world", () -> target().session.joinComment, v -> target().session.joinComment = v, tip); y += TOGGLE;
+		toggle(y, "Comment when I leave a world", () -> target().session.leaveComment, v -> target().session.leaveComment = v, tip); y += TOGGLE;
+		toggle(y, "Comment on periodic backups", () -> target().periodic.comment, v -> target().periodic.comment = v, tip); y += TOGGLE;
+		toggle(y, "Comment on gameplay backups", () -> target().gameplay.comment, v -> target().gameplay.comment = v, tip); y += TOGGLE;
+		toggle(y, "Comment on manual backups", () -> target().manual.comment, v -> target().manual.comment = v, tip); y += TOGGLE + 4;
+		labels.put(y, () -> "Leave: the window appears on the title screen.");
+		labels.put(y + 11, () -> "Esc in the window = back up without a comment.");
+	}
+
+	private static String shorten(String s, int max) { return s.length() > max ? s.substring(0, max - 1) + "..." : s; }
+
+	/** Cloud sync: the world's own switch and number (when a world is in focus), then the defaults for all worlds. */
+	private void syncPage(int y) {
+		int cx = this.width / 2;
+		String id = scopeId();
+		if (id != null) {
+			WorldSettings w = cfg().worldSettings(id);
+			String n = scopeName();
+			btn("Sync \"" + shorten(n, 22) + "\": " + (cfg().isWorldSynced(id) ? "ON" : "OFF"), cx - 130, y, 260, () -> {
+				boolean cur = w.syncEnabled != null ? w.syncEnabled : cfg().sync.newWorldsSync;
+				w.syncEnabled = !cur; w.lastKnownName = n; changed();
+			}, "ON: when you leave this world it is saved to the cloud sync folder, and other computers get it automatically. Needs CloudVault to be ON for this world.");
+			y += TOGGLE;
+			keepStepper(y, "Copies kept for this world", () -> cfg().syncKeep(id), v -> w.syncKeep = v); y += ROW;
+			if (core().inWorld() && id.equals(core().currentWorldId())) {
+				var up = btn("Upload this world now", cx - 130, y, 260, () -> { note = ClientBridge.syncOpenWorldNow() ? "Uploading to the cloud sync folder..." : "Turn sync ON for this world first."; });
+				up.active = cfg().isWorldSynced(id);
+				y += TOGGLE;
+			}
+			y += 4;
+		} else {
+			labels.put(y, () -> "To sync one world: Worlds and Reset > Settings > Cloud Sync.");
+			y += 22;
+		}
+		toggle(y, "New worlds start with cloud sync", () -> cfg().sync.newWorldsSync, v -> cfg().sync.newWorldsSync = v, "OFF (default): sync only runs for worlds you switch on yourself."); y += TOGGLE;
+		keepStepper(y, "Copies kept in the cloud (default)", () -> cfg().sync.keep, v -> cfg().sync.keep = v); y += ROW;
+		toggle(y, "Add/update synced worlds at startup", () -> cfg().sync.autoDownload, v -> cfg().sync.autoDownload = v,
+			"When Minecraft starts, worlds that are in the cloud sync folder but not on this computer are added, and older ones are updated (the old folder is kept in cloudvault/replaced). If a world changed on two computers, the cloud version is added as a separate copy."); y += TOGGLE;
+		btn("Check the cloud now", cx - 130, y, 260, () -> ClientBridge.syncNow(true)); y += TOGGLE;
+		labels.put(y + 2, () -> shorten(core().sync.status(), 56));
+	}
+
+	/** Same layout as the other number rows, but 1..20 (a sync folder always keeps at least the newest copy). */
+	private void keepStepper(int y, String label, IntSupplier get, IntConsumer set) {
+		int x = this.width / 2 - 150;
+		stepButtons(y, get, s -> { set.accept(SyncSettings.clampKeep(get.getAsInt() + s)); changed(); });
+		labels.put(y, () -> label + ": " + get.getAsInt());
+		amountBox(x + 64, y + 12, () -> Integer.toString(get.getAsInt()), t -> { int v = Integer.parseInt(t); if (v >= 1 && v <= SyncSettings.MAX_KEEP) { set.accept(v); edited(); } });
+	}
+
+	private void retentionPage(int y) {
+		toggle(y, "Advanced retention (combine rules)", () -> target().advanced.enabled, v -> target().advanced.enabled = v); y += TOGGLE;
+		if (!target().advanced.enabled) { labels.put(y + 4, () -> "Off: each backup type keeps its own number of old backups."); return; }
+		var a = target().advanced;
+		stepper(y, "Keep the newest", () -> a.keepNewest, v -> a.keepNewest = v, 100, "backups"); y += ROW;
+		stepper(y, "One per day for", () -> a.dailyDays, v -> a.dailyDays = v, 365, "days"); y += ROW;
+		stepper(y, "One per week for", () -> a.weeklyWeeks, v -> a.weeklyWeeks = v, 260, "weeks"); y += ROW;
+		stepper(y, "One per month for", () -> a.monthlyMonths, v -> a.monthlyMonths = v, 120, "months"); y += ROW;
+		labels.put(y, () -> "A backup is kept if ANY rule keeps it. 0 turns a rule off.");
+		labels.put(y + 11, () -> "Applies to each backup type separately.");
+	}
+
+	private void stepper(int y, String label, IntSupplier get, IntConsumer set, int max, String unit) {
+		int x = this.width / 2 - 150;
+		stepButtons(y, get, s -> { set.accept(Math.max(0, Math.min(max, get.getAsInt() + s))); changed(); });
+		labels.put(y, () -> label + ": " + (get.getAsInt() == 0 ? "off" : get.getAsInt() + " " + unit));
+		amountBox(x + 64, y + 12, () -> Integer.toString(get.getAsInt()), t -> { int v = Integer.parseInt(t); if (v >= 0 && v <= max) { set.accept(v); edited(); } });
+	}
+
+	private void cloudPage(int y) {
+		int cx = this.width / 2;
+		boolean useS3 = "s3".equals(cfg().cloudProvider);
+		btn("Provider: " + ClientBridge.providerName(), cx - 155, y, 154, () -> { ClientBridge.selectProvider(useS3 ? "google_drive" : "s3"); rebuild(); note = "New backups now go to " + ClientBridge.providerName() + ". Older ones stay where they are."; });
+		btn("Manage cloud...", cx + 3, y, 152, () -> this.minecraft.gui.setScreen(new CloudManageScreen(this))); y += TOGGLE;
+		toggle(y, "Upload backups to the cloud", () -> cfg().cloudEnabled, v -> cfg().cloudEnabled = v, "Off keeps backups on this computer only. A backup counts as safe once its cloud copy has been uploaded and checked."); y += TOGGLE;
+		toggle(y, "Retry failed uploads", () -> cfg().retryFailedUploads, v -> cfg().retryFailedUploads = v, "Backups that could not upload (for example no internet) stay pending and are tried again automatically."); y += TOGGLE;
+		btn("Wait " + cfg().retryDelaySeconds + "s before retrying (click: +30s)", cx - 130, y, 260, () -> { cfg().retryDelaySeconds = cfg().retryDelaySeconds >= 300 ? 30 : cfg().retryDelaySeconds + 30; changed(); }); y += TOGGLE + 8;
+		if (useS3) {
+			btn("Configure S3-compatible storage...", cx - 130, y, 260, () -> this.minecraft.gui.setScreen(new S3SettingsScreen(this))); y += TOGGLE;
+			btn("Test connection", cx - 130, y, 260, () -> background("test", () -> { var s = ClientBridge.s3.testConnection(); ClientBridge.toast("CloudVault", s.connected() ? "Connected: " + s.account() : s.message()); }));
+			return;
+		}
+		var connect = btn("Connect Google Drive (opens your browser)", cx - 130, y, 260, () -> { core().saveConfig(); note = "Finish signing in in your browser..."; background("auth", () -> {
+			ClientBridge.drive.authenticate(); core().cloud.resumePending(); ClientBridge.toast("CloudVault", "Google Drive connected"); }); }); y += TOGGLE;
+		connect.active = BuiltInOAuth.available();
+		btn("Test connection", cx - 130, y, 128, () -> background("test", () -> { var s = ClientBridge.drive.testConnection(); ClientBridge.toast("CloudVault", s.connected() ? "Connected as " + s.account() : s.message()); }));
+		btn("Disconnect", cx + 2, y, 128, () -> { ClientBridge.drive.signOut(); note = "Disconnected"; });
+		if (!BuiltInOAuth.available()) note = "Google sign-in is not set up in this build of the mod.";
+	}
+
+	private void worldPage(int y) {
+		int cx = this.width / 2;
+		String id = scopeId();
+		if (id != null) {
+			WorldSettings w = cfg().worldSettings(id);
+			String n = scopeName();
+			boolean off = cfg().isWorldDisabled(id);
+			btn((off ? "[ ]" : "[x]") + " CloudVault enabled for this world", cx - 140, y, 280, () -> { core().setWorldEnabled(id, n, off); rebuild(); },
+				"Untick to turn CloudVault off for this world: no backups and no uploads. Backups it already has stay available."); y += TOGGLE;
+			btn("Separate settings for this world: " + (w.useOverride ? "ON" : "OFF"), cx - 140, y, 280, () -> {
+				if (!w.useOverride) { Gson g = new Gson(); w.settings = g.fromJson(g.toJson(cfg().global), BackupSettings.class); }
+				w.useOverride = !w.useOverride; w.lastKnownName = n; changed();
+			}, "ON: the other tabs (including Comments) change only this world. OFF: this world follows the global defaults."); y += TOGGLE;
+			btn("Cloud sync for this world: " + (cfg().isWorldSynced(id) ? "ON" : "OFF"), cx - 140, y, 280, () -> {
+				boolean cur = w.syncEnabled != null ? w.syncEnabled : cfg().sync.newWorldsSync;
+				w.syncEnabled = !cur; w.lastKnownName = n; changed();
+			}, "ON: this world is saved to the cloud sync folder when you leave it and is brought to your other computers automatically. More options in the Cloud Sync tab."); y += TOGGLE + 4;
+			labels.put(y, () -> cfg().isWorldDisabled(id) ? "CloudVault is OFF for \"" + n + "\": no backups or uploads." : w.useOverride ? "The other tabs now change \"" + n + "\" only." : "This world follows the global defaults.");
+			y += 22;
+		} else {
+			labels.put(y, () -> "To change one world: Worlds and Reset > Settings.");
+			y += 22;
+		}
+		toggle(y, "New worlds start with CloudVault", () -> cfg().newWorldsEnabled, v -> core().setNewWorldsEnabled(v),
+			"OFF: worlds you have not switched on yourself do nothing until you tick them. Worlds that already have backups stay ON."); y += TOGGLE;
+		toggle(y, "Show \"CloudVault: ON/OFF\" indicator", () -> cfg().showWorldIndicator, v -> cfg().showWorldIndicator = v,
+			"A small ON/OFF note on screen while you play, on the pause menu button, and when a world opens.");
+	}
+
+	@Override protected void draw(GuiGraphicsExtractor g, int mx, int my) {
+		int cx = this.width / 2;
+		String sid = scopeId();
+		boolean own = sid != null && cfg().worlds.containsKey(sid) && cfg().worlds.get(sid).useOverride;
+		centered(g, own ? "Editing: world \"" + scopeName() + "\"" : scopeWorldId != null ? "Editing: global defaults (\"" + scopeName() + "\" has no separate settings)" : "Editing: global defaults", 68, own ? YELLOW : GREY);
+		if (sid != null && cfg().isWorldDisabled(sid)) centered(g, "CloudVault is OFF for \"" + scopeName() + "\" (World tab).", this.height - 78, RED);
+		String[] d = describe(page);
+		centered(g, d[0], 80, GREY);
+		centered(g, d[1], 91, GREY);
+		labels.forEach((y, t) -> { if (y >= CONTENT_Y - 6 && y <= this.height - 44) left(g, t.get(), cx - 150, y, WHITE); });
+		boolean simpleRetentionPage = page == Page.SESSION || page == Page.PERIODIC || page == Page.GAMEPLAY || page == Page.MANUAL;
+		if (simpleRetentionPage && target().advanced.enabled) centered(g, "Advanced retention is ON: the \"keep\" number above is not used (see Retention tab).", this.height - 54, YELLOW);
+		if (page == Page.CLOUD) {
+			boolean ok = ClientBridge.provider().isAuthenticated();
+			left(g, ok ? "Status: connected" : "Status: not connected", cx - 130, this.height - 40, ok ? GREEN : YELLOW);
+		}
+		if (!note.isEmpty()) centered(g, note, this.height - 66, YELLOW);
+	}
+}
