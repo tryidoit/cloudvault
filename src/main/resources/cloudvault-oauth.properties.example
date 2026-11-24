@@ -1,0 +1,5 @@
+# Copy this file to cloudvault-oauth.properties and fill in your own Google OAuth client (type: Desktop app).
+# cloudvault-oauth.properties is git-ignored so the secret is never committed. Without it, "Connect Google Drive" is disabled
+# (S3-compatible storage and the folder destination still work).
+clientId=
+clientSecret=
