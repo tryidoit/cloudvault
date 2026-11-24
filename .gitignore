@@ -1,0 +1,21 @@
+# build output / tooling
+build/
+.gradle/
+out/
+run/
+.idea/
+*.iml
+.vscode/
+*.log
+
+# secrets - never commit
+src/main/resources/cloudvault-oauth.properties
+**/auth/
+*.secret
+RECOVERY-KEY.txt
+encryption.properties
+
+# secrets: never commit
+src/main/resources/cloudvault-oauth.properties
+outc/
+reference/*.class
