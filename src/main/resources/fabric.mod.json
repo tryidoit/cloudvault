@@ -1,0 +1,25 @@
+{
+	"schemaVersion": 1,
+	"id": "cloudvault",
+	"version": "${version}",
+	"name": "CloudVault",
+	"description": "Automatic, verified world backups to cloud storage, with safe restore.",
+	"authors": ["CloudVault"],
+	"license": "CC0-1.0",
+	"icon": "assets/cloudvault/icon.png",
+	"environment": "client",
+	"entrypoints": {
+		"main": ["com.cloudvault.CloudVault"],
+		"client": ["com.cloudvault.client.CloudVaultClient"],
+		"modmenu": ["com.cloudvault.client.CloudVaultModMenu"]
+	},
+	"suggests": {
+		"modmenu": "*"
+	},
+	"depends": {
+		"fabricloader": ">=0.19.5",
+		"minecraft": "~26.3",
+		"java": ">=25",
+		"fabric-api": "*"
+	}
+}
